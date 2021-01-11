@@ -70,7 +70,18 @@ class SystemConfig:
             "WithoutLogger": False,
             "RequestSizeLimit": {},
             "DefaultPort": 19952,
+            "IllegalTimeMessage": "The maximum number of requests has been exceeded.",
+            "ExceededMessage": "Illegal access time, please request in open hours.",
             "BlacklistTriggerTimes": -1,
+            "Whitelist": False,
+            "ErrorMessage": {
+                400: "Bad Request",
+                401: "Unicode Decode Error",
+                403: "Forbidden",
+                404: "404 Not Found",
+                405: "Method Not Allowed",
+                500: "Internal Server Error"
+            }
         },
         "RouteMap": default_route,
         "Security": {
@@ -86,7 +97,7 @@ class SystemConfig:
             "StatusCode": "code",
             "StatusBool": "success",
             "Uid": "uid",
-        },
+        }
     }
 
 

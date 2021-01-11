@@ -24,7 +24,7 @@ from constants import Response
 from json.decoder import JSONDecodeError
 from tornado.escape import json_decode, json_encode
 from interface import InterfaceManager, Interface
-from config import Config, blacklist, set_blacklist, get_version
+from config import Config, blacklist, set_blacklist, whitelist, get_version
 from utils import ImageUtils, ParamUtils, Arithmetic
 from signature import Signature, ServerType
 from tornado.concurrent import run_on_executor
@@ -33,6 +33,7 @@ from middleware import *
 from event_loop import event_loop
 
 tornado.options.define('ip_blacklist', default=list(), type=list)
+tornado.options.define('ip_whitelist', default=list(), type=list)
 tornado.options.define('ip_risk_times', default=dict(), type=dict)
 tornado.options.define('request_count', default=dict(), type=dict)
 tornado.options.define('global_request_count', default=0, type=int)
@@ -102,22 +103,15 @@ class BaseHandler(RequestHandler):
         return data
 
     def write_error(self, code, **kw):
-        system = {
-            500: dict(StatusCode=code, Message="Internal Server Error", StatusBool=False),
-            400: dict(StatusCode=code, Message="Bad Request", StatusBool=False),
-            404: dict(StatusCode=code, Message="404 Not Found", StatusBool=False),
-            403: dict(StatusCode=code, Message="Forbidden", StatusBool=False),
-            405: dict(StatusCode=code, Message="Method Not Allowed", StatusBool=False),
-        }
-        if code in system.keys():
-            code_dict = Response.parse(system.get(code), system_config.response_def_map)
+        err_resp = dict(StatusCode=code, Message=system_config.error_message[code], StatusBool=False)
+        if code in system_config.error_message:
+            code_dict = Response.parse(err_resp, system_config.response_def_map)
         else:
             code_dict = self.exception.find(code)
-        return self.finish(json_encode(code_dict))
+        return self.finish(json.dumps(code_dict, ensure_ascii=False))
 
 
 class NoAuthHandler(BaseHandler):
-
     uid_key: str = system_config.response_def_map['Uid']
     message_key: str = system_config.response_def_map['Message']
     status_bool_key = system_config.response_def_map['StatusBool']
@@ -135,7 +129,7 @@ class NoAuthHandler(BaseHandler):
     @run_on_executor
     def predict(self, interface: Interface, image_batch, split_char):
         result = interface.predict_batch(image_batch, split_char)
-        if interface.model_category == 'ARITHMETIC':
+        if 'ARITHMETIC' in interface.model_category:
             if '=' in result or '+' in result or '-' in result or '×' in result or '÷' in result:
                 result = result.replace("×", "*").replace("÷", "/")
                 result = str(int(arithmetic.calc(result)))
@@ -147,6 +141,17 @@ class NoAuthHandler(BaseHandler):
             if ip.startswith(black_ip):
                 return True
         return False
+
+    @staticmethod
+    def match_whitelist(ip: str):
+        for white_ip in tornado.options.options.ip_whitelist:
+            if ip.startswith(white_ip):
+                return True
+        return False
+
+    async def options(self):
+        self.set_status(204)
+        return self.finish()
 
     @tornado.gen.coroutine
     def post(self):
@@ -163,6 +168,7 @@ class NoAuthHandler(BaseHandler):
         output_split = ParamUtils.filter(data.get('output_split'))
         need_color = ParamUtils.filter(data.get('need_color'))
         param_key = ParamUtils.filter(data.get('param_key'))
+        extract_rgb = ParamUtils.filter(data.get('extract_rgb'))
 
         request_incr = self.request_incr
         global_count = self.global_request_incr
@@ -178,6 +184,18 @@ class NoAuthHandler(BaseHandler):
                 {self.uid_key: uid, self.message_key: "", self.status_bool_key: False, self.status_code_key: -999}
             ))
         bytes_batch, response = self.image_utils.get_bytes_batch(data[input_data_key])
+
+        if not (opt.low_hour == -1 or opt.up_hour == -1) and not (opt.low_hour <= time.localtime().tm_hour <= opt.up_hour):
+            logger.info("[{}] - [{} {}] | - Response[{}] - {} ms".format(
+                uid, self.request.remote_ip, self.request.uri, "Not in open time.",
+                (time.time() - start_time) * 1000)
+            )
+            return self.finish(json.dumps({
+                self.uid_key: uid,
+                self.message_key: system_config.illegal_time_msg.format(opt.low_hour, opt.up_hour),
+                self.status_bool_key: False,
+                self.status_code_key: -250
+            }, ensure_ascii=False))
 
         if not bytes_batch:
             logger.error('[{}] - [{} {}] | - Response[{}] - {} ms'.format(
@@ -208,6 +226,21 @@ class NoAuthHandler(BaseHandler):
                 self.status_code_key: -250
             }, ensure_ascii=False))
 
+        if system_config.use_whitelist:
+            assert_whitelist = self.match_whitelist(self.request.remote_ip)
+            if not assert_whitelist:
+                logger.info('[{}] - [{} {}] | Size[{}]{}{} - Error[{}] - {} ms'.format(
+                    uid, self.request.remote_ip, self.request.uri, size_string, request_count, log_params,
+                    "Whitelist limit",
+                    round((time.time() - start_time) * 1000))
+                )
+                return self.finish(json.dumps({
+                    self.uid_key: uid,
+                    self.message_key: "Only allow IP access in the whitelist",
+                    self.status_bool_key: False,
+                    self.status_code_key: -111
+                }, ensure_ascii=False))
+
         if global_request_limit != -1 and global_count > global_request_limit:
             logger.info('[{}] - [{} {}] | Size[{}]{}{} - Error[{}] - {} ms'.format(
                 uid, self.request.remote_ip, self.request.uri, size_string, global_count, log_params,
@@ -237,7 +270,8 @@ class NoAuthHandler(BaseHandler):
         if request_limit != -1 and request_incr > request_limit:
             self.risk_ip_count(self.request.remote_ip)
             assert_blacklist_trigger = system_config.blacklist_trigger_times != -1
-            if self.risk_ip(self.request.remote_ip) > system_config.blacklist_trigger_times and assert_blacklist_trigger:
+            if self.risk_ip(
+                    self.request.remote_ip) > system_config.blacklist_trigger_times and assert_blacklist_trigger:
                 if self.request.remote_ip not in blacklist():
                     set_blacklist(self.request.remote_ip)
                     update_blacklist()
@@ -253,9 +287,9 @@ class NoAuthHandler(BaseHandler):
                 self.status_code_key: -444
             }, ensure_ascii=False))
         if model_name_key in data and data[model_name_key]:
-            interface = interface_manager.get_by_name(model_name)
+            interface: Interface = interface_manager.get_by_name(model_name)
         else:
-            interface = interface_manager.get_by_size(size_string)
+            interface: Interface = interface_manager.get_by_size(size_string)
         if not interface:
             self.request_desc()
             self.global_request_desc()
@@ -268,7 +302,8 @@ class NoAuthHandler(BaseHandler):
 
         if interface.model_conf.corp_params:
             bytes_batch = corp_to_multi.parse_multi_img(bytes_batch, interface.model_conf.corp_params)
-
+        if interface.model_conf.pre_freq_frames != -1:
+            bytes_batch = gif_frames.all_frames(bytes_batch)
         exec_map = interface.model_conf.exec_map
         if exec_map and len(exec_map.keys()) > 1 and not param_key:
             self.request_desc()
@@ -324,7 +359,8 @@ class NoAuthHandler(BaseHandler):
                 )
 
                 text = yield self.predict(
-                    sub_interface, image_batch, output_split, size_string, start_time, log_params, request_count, uid=uid
+                    sub_interface, image_batch, output_split, size_string, start_time, log_params, request_count,
+                    uid=uid
                 )
                 result.append(text)
                 len_of_result.append(len(result[0].split(sub_interface.model_conf.category_split)))
@@ -341,7 +377,12 @@ class NoAuthHandler(BaseHandler):
                 )
             return self.finish(json.dumps(response, ensure_ascii=False).replace("</", "<\\/"))
         else:
-            image_batch, response = ImageUtils.get_image_batch(interface.model_conf, bytes_batch, param_key=param_key)
+            image_batch, response = ImageUtils.get_image_batch(
+                interface.model_conf,
+                bytes_batch,
+                param_key=param_key,
+                extract_rgb=extract_rgb
+            )
 
         if not image_batch:
             self.request_desc()
@@ -354,12 +395,18 @@ class NoAuthHandler(BaseHandler):
             return self.finish(json_encode(response))
 
         predict_result = yield self.predict(interface, image_batch, output_split)
-
-        if need_color:
-            # only support six label and size [90x35].
-            color_batch = np.resize(image_batch[0], (90, 35, 3))
-            need_index = color_extract.predict_color(image_batch=[color_batch], color=color_map[need_color])
-            predict_result = "".join([v for i, v in enumerate(predict_result) if i in need_index])
+        if interface.model_conf.pre_freq_frames != -1:
+            predict_result = predict_result.split(interface.model_conf.output_split)
+            predict_result = [
+                i for i in predict_result
+                if interface.model_conf.max_label_num >= len(i) >= interface.model_conf.min_label_num
+            ]
+            predict_result = gif_frames.get_continuity_max(predict_result)
+        # if need_color:
+        #     # only support six label and size [90x35].
+        #     color_batch = np.resize(image_batch[0], (90, 35, 3))
+        #     need_index = color_extract.predict_color(image_batch=[color_batch], color=color_map[need_color])
+        #     predict_result = "".join([v for i, v in enumerate(predict_result) if i in need_index])
 
         uid_str = "[{}] - ".format(uid)
         logger.info('{}[{} {}] | [{}] - Size[{}]{}{} - Predict[{}] - {} ms'.format(
@@ -370,15 +417,15 @@ class NoAuthHandler(BaseHandler):
         response[self.message_key] = predict_result
         response[self.uid_key] = uid
         self.executor.submit(self.save_image, uid, response[self.message_key], bytes_batch[0])
-        # if interface.model_conf.corp_params and interface.model_conf.output_coord:
-        #     # final_result = auxiliary_result + "," + response[self.message_key]
-        #     # if auxiliary_result else response[self.message_key]
-        #     final_result = response[self.message_key]
-        #     response[self.message_key] = corp_to_multi.get_coordinate(
-        #         label=final_result,
-        #         param_group=interface.model_conf.corp_params,
-        #         title_index=[0]
-        #     )
+        if interface.model_conf.corp_params and interface.model_conf.output_coord:
+            # final_result = auxiliary_result + "," + response[self.message_key]
+            # if auxiliary_result else response[self.message_key]
+            final_result = response[self.message_key]
+            response[self.message_key] = corp_to_multi.get_coordinate(
+                label=final_result,
+                param_group=interface.model_conf.corp_params,
+                title_index=[0]
+            )
         return self.finish(json.dumps(response, ensure_ascii=False).replace("</", "<\\/"))
 
 
@@ -390,7 +437,6 @@ class AuthHandler(NoAuthHandler):
 
 
 class SimpleHandler(BaseHandler):
-
     uid_key: str = system_config.response_def_map['Uid']
     message_key: str = system_config.response_def_map['Message']
     status_bool_key = system_config.response_def_map['StatusBool']
@@ -500,11 +546,14 @@ def update_blacklist():
 
 
 def make_app(route: list):
-    return tornado.web.Application([
-        (i['Route'], globals()[i['Class']], i.get("Param"))
-        if "Param" in i else
-        (i['Route'], globals()[i['Class']]) for i in route
-    ])
+    return tornado.web.Application(
+        [
+            (i['Route'], globals()[i['Class']], i.get("Param"))
+            if "Param" in i else
+            (i['Route'], globals()[i['Class']]) for i in route
+        ],
+        static_path=os.path.join(os.path.dirname(__file__), "resource"),
+    )
 
 
 trigger_specific = IntervalTrigger(seconds=system_config.request_count_interval)
@@ -516,9 +565,6 @@ scheduler.add_job(clear_global_job, trigger_global)
 scheduler.start()
 
 if __name__ == "__main__":
-    if platform.system() == 'Windows':
-        os.system("chcp 65001")
-        os.system("title=Eve-DL Platform v0.1({})".format(get_version()))
     parser = optparse.OptionParser()
 
     request_limit = system_config.request_limit
@@ -526,8 +572,15 @@ if __name__ == "__main__":
 
     parser.add_option('-p', '--port', type="int", default=system_config.default_port, dest="port")
     parser.add_option('-w', '--workers', type="int", default=50, dest="workers")
+    parser.add_option('--up_hour', type="int", default=-1, dest="up_hour")
+    parser.add_option('--low_hour', type="int", default=-1, dest="low_hour")
+
     opt, args = parser.parse_args()
     server_port = opt.port
+
+    if platform.system() == 'Windows':
+        # os.system("chcp 65001")
+        os.system("title=Eve-DL Platform v0.1({}) ^| [{}]".format(get_version(), server_port))
 
     workers = opt.workers
     logger = system_config.logger
@@ -538,6 +591,8 @@ if __name__ == "__main__":
 
     sign.set_auth([{'accessKey': system_config.access_key, 'secretKey': system_config.secret_key}])
 
+    tornado.options.options.ip_whitelist = whitelist()
+
     server_host = "0.0.0.0"
     logger.info('Running on http://{}:{}/ <Press CTRL + C to quit>'.format(server_host, server_port))
     app = make_app(system_config.route_map)
@@ -545,6 +600,3 @@ if __name__ == "__main__":
     http_server.bind(server_port, server_host)
     http_server.start(1)
     tornado.ioloop.IOLoop.instance().start()
-
-
-

@@ -22,6 +22,7 @@ MODEL_FIELD_MAP = {
 }
 
 BLACKLIST_PATH = "blacklist.json"
+WHITELIST_PATH = "whitelist.json"
 
 
 def resource_path(relative_path):
@@ -47,6 +48,14 @@ def get_default(src, default):
     return src if src else default
 
 
+def get_dict_fill(src: dict, default: dict):
+    if not src:
+        return default
+    new_dict = default
+    new_dict.update(src)
+    return new_dict
+
+
 def blacklist() -> list:
     if not os.path.exists(BLACKLIST_PATH):
         return []
@@ -57,6 +66,18 @@ def blacklist() -> list:
     except Exception as e:
         print(e)
         return []
+
+
+def whitelist() -> list:
+    if not os.path.exists(WHITELIST_PATH):
+        return ["127.0.0.1", "localhost"]
+    try:
+        with open(WHITELIST_PATH, "r", encoding="utf8") as f_whitelist:
+            result = json.loads("".join(f_whitelist.readlines()))
+            return result
+    except Exception as e:
+        print(e)
+        return ["127.0.0.1", "localhost"]
 
 
 def set_blacklist(ip):
@@ -100,7 +121,11 @@ class Config(object):
         self.global_request_limit = get_default(self.sys_cf['System'].get("GlobalRequestLimit"), -1)
         self.exceeded_msg = get_default(
             src=self.sys_cf['System'].get("ExceededMessage"),
-            default="The maximum number of requests has been exceeded"
+            default=SystemConfig.default_config['System'].get('ExceededMessage')
+        )
+        self.illegal_time_msg = get_default(
+            src=self.sys_cf['System'].get("IllegalTimeMessage"),
+            default=SystemConfig.default_config['System'].get('IllegalTimeMessage')
         )
 
         self.request_size_limit: dict = get_default(
@@ -109,6 +134,14 @@ class Config(object):
         )
         self.blacklist_trigger_times = get_default(self.sys_cf['System'].get("BlacklistTriggerTimes"), -1)
 
+        self.use_whitelist: dict = get_default(
+            src=self.sys_cf['System'].get('Whitelist'),
+            default=False
+        )
+
+        self.error_message = get_dict_fill(
+            self.sys_cf['System'].get('ErrorMessage'), SystemConfig.default_config['System']['ErrorMessage']
+        )
         self.logger_tag = get_default(self.sys_cf['System'].get('LoggerTag'), "coriander")
         self.without_logger = self.sys_cf['System'].get('WithoutLogger')
         self.without_logger = self.without_logger if self.without_logger is not None else False
@@ -267,6 +300,8 @@ class ModelConfig(Model):
         self.image_channel: int = self.field_root.get('ImageChannel')
         self.image_width: int = self.field_root.get('ImageWidth')
         self.image_height: int = self.field_root.get('ImageHeight')
+        self.max_label_num: int = self.field_root.get('MaxLabelNum')
+        self.min_label_num: int = self.get_var(self.field_root, 'MinLabelNum', self.max_label_num)
         self.resize: list = self.field_root.get('Resize')
         self.output_split = self.field_root.get('OutputSplit')
         self.output_split = self.output_split if self.output_split else ""
@@ -283,6 +318,7 @@ class ModelConfig(Model):
         self.pre_horizontal_stitching = self.get_var(self.pretreatment_root, 'HorizontalStitching', False)
         self.pre_concat_frames = self.get_var(self.pretreatment_root, 'ConcatFrames', -1)
         self.pre_blend_frames = self.get_var(self.pretreatment_root, 'BlendFrames', -1)
+        self.pre_freq_frames = self.get_var(self.pretreatment_root, 'FreqFrames', -1)
         self.exec_map = self.get_var(self.pretreatment_root, 'ExecuteMap', None)
 
         """COMPILE_MODEL"""
@@ -309,7 +345,7 @@ class ModelConfig(Model):
 
     @staticmethod
     def get_var(src: dict, name: str, default=None):
-        if not src:
+        if not src or name not in src:
             return default
         return src.get(name)
 
